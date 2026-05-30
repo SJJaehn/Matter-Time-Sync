@@ -2,10 +2,19 @@ sync_time:
   name: Sync time
   description: Synchronizes time on a single Matter device.
   fields:
+    entity_id:
+      name: Device
+      description: The Matter Time Sync button entity
+      required: false
+      example: "button.alpstuga_sync_time"
+      selector:
+        entity:
+          integration: matter_time_sync
+          domain: button
     node_id:
       name: Node ID
-      description: The Matter Node ID of the device
-      required: true
+      description: The Matter Node ID (alternative to selecting device)
+      required: false
       example: 1
       selector:
         number:
@@ -30,3 +39,44 @@ sync_all:
 refresh_devices:
   name: Refresh devices
   description: Scan for new Matter devices and create buttons for them.
+
+set_custom_time:
+  name: Set custom time
+  description: Sets a custom time on a Matter device. Auto-sync will be paused for this device until a regular sync is performed.
+  fields:
+    entity_id:
+      name: Device
+      description: The Matter Time Sync button entity
+      required: false
+      example: "button.alpstuga_sync_time"
+      selector:
+        entity:
+          integration: matter_time_sync
+          domain: button
+    node_id:
+      name: Node ID
+      description: The Matter Node ID (alternative to selecting device)
+      required: false
+      example: 1
+      selector:
+        number:
+          min: 1
+          max: 65535
+          mode: box
+    time:
+      name: Time
+      description: The time to set (HH:MM or HH:MM:SS format). Uses current date.
+      required: true
+      example: "14:30"
+      selector:
+        time:
+    endpoint:
+      name: Endpoint
+      description: The Matter Endpoint (usually 0)
+      default: 0
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 255
+          mode: box

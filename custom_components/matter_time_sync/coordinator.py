@@ -115,6 +115,9 @@ class MatterTimeSyncCoordinator:
         self._auto_sync_running = False
         self._auto_sync_lock = asyncio.Lock()
 
+        # Nodes with paused auto-sync (set_custom_time pauses until manual sync)
+        self._auto_sync_paused_nodes: set[int] = set()
+
     @property
     def is_connected(self) -> bool:
         """Return True if connected to Matter Server."""
@@ -513,6 +516,14 @@ class MatterTimeSyncCoordinator:
             )
 
     # ------------------------------------------------------------------
+    # Custom time helpers
+    # ------------------------------------------------------------------
+
+    def is_auto_sync_paused(self, node_id: int) -> bool:
+        """Check if auto-sync is paused for a specific node."""
+        return node_id in self._auto_sync_paused_nodes
+
+    # ------------------------------------------------------------------
     # Time synchronisation
     # ------------------------------------------------------------------
 
@@ -538,6 +549,11 @@ class MatterTimeSyncCoordinator:
 
     async def _do_sync_time(self, node_id: int, endpoint: int | None = None) -> bool:
         """Internal method to perform time sync (called within lock)."""
+        # Re-enable auto-sync for this node if it was paused by set_custom_time
+        if node_id in self._auto_sync_paused_nodes:
+            self._auto_sync_paused_nodes.discard(node_id)
+            _LOGGER.info("Re-enabled auto-sync for node %s", node_id)
+
         _LOGGER.debug("Starting time sync for node %s (endpoint %s)", node_id, endpoint)
 
         # Ensure we have node info for endpoint auto-selection
@@ -727,6 +743,158 @@ class MatterTimeSyncCoordinator:
         )
         return True
 
+    async def async_set_custom_time(
+        self, node_id: int, time_str: str, endpoint: int | None = None
+    ) -> bool:
+        """Set a custom time on a Matter device.
+
+        Pauses auto-sync for this node until a regular sync_time is performed.
+        """
+        # Parse the time string
+        try:
+            if hasattr(time_str, "hour"):
+                hour, minute, second = time_str.hour, time_str.minute, time_str.second
+            else:
+                time_str = str(time_str)
+                time_parts = time_str.split(":")
+                if len(time_parts) == 2:
+                    hour, minute = int(time_parts[0]), int(time_parts[1])
+                    second = 0
+                elif len(time_parts) == 3:
+                    hour, minute, second = (
+                        int(time_parts[0]),
+                        int(time_parts[1]),
+                        int(time_parts[2]),
+                    )
+                else:
+                    _LOGGER.error(
+                        "Invalid time format: %s. Use HH:MM or HH:MM:SS", time_str
+                    )
+                    return False
+
+            if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+                _LOGGER.error("Invalid time values: %s", time_str)
+                return False
+        except ValueError as err:
+            _LOGGER.error("Failed to parse time '%s': %s", time_str, err)
+            return False
+
+        # Pause auto-sync for this node
+        self._auto_sync_paused_nodes.add(node_id)
+        _LOGGER.info(
+            "Auto-sync paused for node %s (call sync_time to re-enable)", node_id
+        )
+
+        lock = self._per_node_sync_locks.setdefault(node_id, asyncio.Lock())
+        async with lock:
+            # Ensure we have node info for endpoint auto-selection
+            if not self._nodes_cache:
+                await self.async_get_matter_nodes()
+
+            endpoint_id = endpoint
+            if endpoint_id is None:
+                node = next(
+                    (n for n in self._nodes_cache if n.get("node_id") == node_id),
+                    None,
+                )
+                endpoints = (node or {}).get("time_sync_endpoints") or []
+                endpoint_id = endpoints[0] if endpoints else 0
+
+            try:
+                tz = ZoneInfo(self._timezone)
+            except Exception:
+                _LOGGER.warning("Invalid timezone %s, using UTC", self._timezone)
+                tz = ZoneInfo("UTC")
+
+            now = datetime.now(tz)
+            custom_datetime = now.replace(
+                hour=hour, minute=minute, second=second, microsecond=0
+            )
+            utc_custom = custom_datetime.astimezone(ZoneInfo("UTC"))
+
+            total_offset = (
+                int(custom_datetime.utcoffset().total_seconds())
+                if custom_datetime.utcoffset()
+                else 0
+            )
+            utc_offset = total_offset
+            dst_offset = 0
+
+            utc_microseconds = _to_chip_epoch_us(utc_custom)
+
+            _LOGGER.info(
+                "Setting custom time for node %s: local=%s, UTC=%s, offset=%ds",
+                node_id,
+                custom_datetime.isoformat(),
+                utc_custom.isoformat(),
+                utc_offset,
+            )
+
+            # 1) Set TimeZone
+            tz_list = [{"offset": utc_offset, "validAt": 0}]
+            tz_response = await self._async_send_command(
+                "device_command",
+                {
+                    "node_id": node_id,
+                    "endpoint_id": endpoint_id,
+                    "cluster_id": TIME_SYNC_CLUSTER_ID,
+                    "command_name": "SetTimeZone",
+                    "payload": {"timeZone": tz_list},
+                },
+            )
+            if tz_response:
+                _LOGGER.debug("SetTimeZone successful for node %s", node_id)
+            else:
+                _LOGGER.warning(
+                    "SetTimeZone failed for node %s (continuing anyway)", node_id
+                )
+
+            # 2) Set DST Offset
+            far_future_us = _to_chip_epoch_us(utc_custom + timedelta(days=365))
+            dst_list = [
+                {
+                    "offset": dst_offset,
+                    "validStarting": 0,
+                    "validUntil": far_future_us,
+                }
+            ]
+            await self._async_send_command(
+                "device_command",
+                {
+                    "node_id": node_id,
+                    "endpoint_id": endpoint_id,
+                    "cluster_id": TIME_SYNC_CLUSTER_ID,
+                    "command_name": "SetDSTOffset",
+                    "payload": {"DSTOffset": dst_list},
+                },
+            )
+
+            # 3) Set UTC Time
+            payload_utc = {"UTCTime": utc_microseconds, "granularity": 4}
+            time_response = await self._async_send_command(
+                "device_command",
+                {
+                    "node_id": node_id,
+                    "endpoint_id": endpoint_id,
+                    "cluster_id": TIME_SYNC_CLUSTER_ID,
+                    "command_name": "SetUTCTime",
+                    "payload": payload_utc,
+                },
+            )
+
+            if not time_response:
+                _LOGGER.error(
+                    "Failed to set custom time for node %s (SetUTCTime failed)", node_id
+                )
+                return False
+
+            _LOGGER.info(
+                "Custom time set for node %s: %s",
+                node_id,
+                custom_datetime.isoformat(),
+            )
+            return True
+
     # ------------------------------------------------------------------
     # Bulk sync
     # ------------------------------------------------------------------
@@ -801,6 +969,16 @@ class MatterTimeSyncCoordinator:
                         stats["skipped"] += 1
                         _LOGGER.debug(
                             "Skipping node %s (%s) - filtered out",
+                            node_id,
+                            node_name,
+                        )
+                        continue
+
+                    # Skip nodes with paused auto-sync (custom time set)
+                    if node_id in self._auto_sync_paused_nodes:
+                        stats["skipped"] += 1
+                        _LOGGER.debug(
+                            "Skipping node %s (%s) - custom time set (call sync_time to re-enable)",
                             node_id,
                             node_name,
                         )

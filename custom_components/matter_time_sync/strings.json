@@ -82,9 +82,13 @@
       "name": "Sync Time",
       "description": "Synchronizes the time on a single Matter device.",
       "fields": {
+        "entity_id": {
+          "name": "Device",
+          "description": "The Matter Time Sync button entity"
+        },
         "node_id": {
           "name": "Node ID",
-          "description": "The Matter Node ID of the device"
+          "description": "The Matter Node ID (alternative to selecting device)"
         },
         "endpoint": {
           "name": "Endpoint",
@@ -99,6 +103,28 @@
     "refresh_devices": {
       "name": "Refresh Devices",
       "description": "Searches for new Matter devices and automatically creates buttons for them."
+    },
+    "set_custom_time": {
+      "name": "Set Custom Time",
+      "description": "Sets a custom time on a Matter device. Auto-sync will be paused for this device until a regular sync is performed.",
+      "fields": {
+        "entity_id": {
+          "name": "Device",
+          "description": "The Matter Time Sync button entity"
+        },
+        "node_id": {
+          "name": "Node ID",
+          "description": "The Matter Node ID (alternative to selecting device)"
+        },
+        "time": {
+          "name": "Time",
+          "description": "The time to set (HH:MM or HH:MM:SS). Uses current date."
+        },
+        "endpoint": {
+          "name": "Endpoint",
+          "description": "The Matter Endpoint (usually 0)"
+        }
+      }
     }
   }
 }

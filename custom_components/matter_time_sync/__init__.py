@@ -6,15 +6,18 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import ATTR_ENTITY_ID
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.event import async_track_time_interval
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import entity_registry as er
 
 from .const import (
     DOMAIN,
     SERVICE_SYNC_TIME,
     SERVICE_SYNC_ALL,
     SERVICE_REFRESH_DEVICES,
+    SERVICE_SET_CUSTOM_TIME,
     PLATFORMS,
     CONF_AUTO_SYNC_ENABLED,
     CONF_AUTO_SYNC_INTERVAL,
@@ -27,15 +30,50 @@ from .coordinator import MatterTimeSyncCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-# Schema for sync_time service — endpoint is truly optional (None = auto-detect)
-# Use vol.Range(min=0) instead of cv.positive_int for endpoint because
-# Matter endpoint 0 (root endpoint) is valid and commonly used.
+# Schema for sync_time service — accepts node_id OR entity_id (at least one required)
 SYNC_TIME_SCHEMA = vol.Schema(
     {
-        vol.Required("node_id"): cv.positive_int,
+        vol.Optional("node_id"): cv.positive_int,
+        vol.Optional(ATTR_ENTITY_ID): cv.entity_id,
         vol.Optional("endpoint"): vol.All(int, vol.Range(min=0)),
     }
 )
+
+SET_CUSTOM_TIME_SCHEMA = vol.Schema(
+    {
+        vol.Optional("node_id"): cv.positive_int,
+        vol.Optional(ATTR_ENTITY_ID): cv.entity_id,
+        vol.Required("time"): cv.string,
+        vol.Optional("endpoint"): vol.All(int, vol.Range(min=0)),
+    }
+)
+
+
+def _get_node_id_from_call(hass: HomeAssistant, call: ServiceCall) -> int | None:
+    """Extract node_id from service call — direct node_id takes priority over entity_id."""
+    if "node_id" in call.data:
+        return call.data["node_id"]
+
+    entity_id = call.data.get(ATTR_ENTITY_ID)
+    if not entity_id:
+        _LOGGER.error("No node_id or entity_id provided")
+        return None
+
+    state = hass.states.get(entity_id)
+    if state and "node_id" in state.attributes:
+        return state.attributes["node_id"]
+
+    ent_reg = er.async_get(hass)
+    entity_entry = ent_reg.async_get(entity_id)
+    if entity_entry and entity_entry.unique_id:
+        try:
+            if entity_entry.unique_id.startswith("matter_time_sync_"):
+                return int(entity_entry.unique_id.replace("matter_time_sync_", ""))
+        except ValueError:
+            pass
+
+    _LOGGER.error("Could not determine node_id from entity %s", entity_id)
+    return None
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -120,7 +158,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # 6. Define Service Handlers
     async def handle_sync_time(call: ServiceCall) -> None:
         """Handle the sync_time service call."""
-        node_id = call.data["node_id"]
+        node_id = _get_node_id_from_call(hass, call)
+        if node_id is None:
+            return
         endpoint = call.data.get("endpoint")
 
         for eid, edata in hass.data[DOMAIN].items():
@@ -156,6 +196,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 await coord.async_get_matter_nodes()
                 await async_check_new_devices(hass, eid)
 
+    async def handle_set_custom_time(call: ServiceCall) -> None:
+        """Handle the set_custom_time service call."""
+        node_id = _get_node_id_from_call(hass, call)
+        if node_id is None:
+            return
+        time_str = call.data["time"]
+        endpoint = call.data.get("endpoint")
+
+        for eid, edata in hass.data[DOMAIN].items():
+            coord = edata.get("coordinator")
+            if coord:
+                await coord.async_set_custom_time(node_id, time_str, endpoint)
+                return
+
+        _LOGGER.error("No Matter Time Sync coordinator found for set_custom_time")
+
     # 7. Register Services (only once)
     if not hass.services.has_service(DOMAIN, SERVICE_SYNC_TIME):
         hass.services.async_register(
@@ -166,6 +222,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not hass.services.has_service(DOMAIN, SERVICE_REFRESH_DEVICES):
         hass.services.async_register(
             DOMAIN, SERVICE_REFRESH_DEVICES, handle_refresh_devices
+        )
+    if not hass.services.has_service(DOMAIN, SERVICE_SET_CUSTOM_TIME):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SET_CUSTOM_TIME,
+            handle_set_custom_time,
+            schema=SET_CUSTOM_TIME_SCHEMA,
         )
 
     # 8. Listen for config options updates
@@ -206,5 +269,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_SYNC_TIME)
             hass.services.async_remove(DOMAIN, SERVICE_SYNC_ALL)
             hass.services.async_remove(DOMAIN, SERVICE_REFRESH_DEVICES)
+            hass.services.async_remove(DOMAIN, SERVICE_SET_CUSTOM_TIME)
 
     return unload_ok
